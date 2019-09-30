@@ -92,7 +92,9 @@ class GenearteSentimentAnalysisData(gokart.TaskOnKart):
         jumanpp = Juman()
         output = []
         for _, row in data.iterrows():
-            zenkaku = jaconv.h2z(row["sentence"], ascii=True, digit=True)
+            zenkaku = jaconv.h2z(row["sentence"].replace(' ', ''),
+                                 ascii=True,
+                                 digit=True)
             splited = [
                 mrph.midasi for mrph in jumanpp.analysis(zenkaku).mrph_list()
             ]
