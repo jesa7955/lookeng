@@ -23,18 +23,30 @@ from tqdm import tqdm, trange
 from absa_bert_pair import tokenization
 from absa_bert_pair.modeling import BertConfig, BertForSequenceClassification
 from absa_bert_pair.optimization import BERTAdam
-from absa_bert_pair.processor import (Sentihood_NLI_B_Processor,
-                                      Sentihood_NLI_M_Processor,
-                                      Sentihood_QA_B_Processor,
-                                      Sentihood_QA_M_Processor)
 
 from .data_reader import GenearteSentimentAnalysisData
 
-logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-    datefmt='%m/%d/%Y %H:%M:%S',
-    level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('luigi-interface')
+
+
+class InputExample(object):
+    """A single training/test example for simple sequence classification."""
+    def __init__(self, guid, text_a, text_b=None, label=None):
+        """Constructs a InputExample.
+
+        Args:
+            guid: Unique id for the example.
+            text_a: string. The untokenized text of the first sequence. For single
+            sequence tasks, only this sequence must be specified.
+            text_b: (Optional) string. The untokenized text of the second sequence.
+            Only must be specified for sequence pair tasks.
+            label: (Optional) string. The label of the example. This should be
+            specified for train and dev examples, but not for test examples.
+        """
+        self.guid = guid
+        self.text_a = text_a
+        self.text_b = text_b
+        self.label = label
 
 
 class InputFeatures(object):
@@ -44,6 +56,17 @@ class InputFeatures(object):
         self.input_mask = input_mask
         self.segment_ids = segment_ids
         self.label_id = label_id
+
+
+def create_examples(data, split: str):
+    return [
+        InputExample(
+            guid=f'{split}-{index}',
+            text_a=tokenization.convert_to_unicode(str(example['sentence1'])),
+            text_b=tokenization.convert_to_unicode(str(example['sentence2'])),
+            label=tokenization.convert_to_unicode(str(example['label'])))
+        for index, example in enumerate(data[split])
+    ]
 
 
 def convert_examples_to_features(examples, label_list, max_seq_length,
@@ -137,9 +160,10 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
     """Truncates a sequence pair in place to the maximum length."""
 
     # This is a simple heuristic which will always truncate the longer sequence
-    # one token at a time. This makes more sense than truncating an equal percent
-    # of tokens from each, since if one sequence is very short then each token
-    # that's truncated likely contains more information than a longer sequence.
+    # one token at a time. This makes more sense than truncating an equal
+    # percent of tokens from each, since if one sequence is very short then
+    # each token that's truncated likely contains more information than a
+    # longer sequence.
     while True:
         total_length = len(tokens_a) + len(tokens_b)
         if total_length <= max_length:
@@ -150,7 +174,7 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
             tokens_b.pop()
 
 
-class BertFineTuningTrainer(gokart.TaskOnKart):
+class FineTuningBertClassifier(gokart.TaskOnKart):
     task_namespace = "m3lookeng"
     # TODO: QA_M, NLI_M, QA_B, NLI_M
     task_name = luigi.Parameter()
@@ -176,90 +200,78 @@ class BertFineTuningTrainer(gokart.TaskOnKart):
     seed = luigi.IntParameter()
 
     def requires(self):
+        # TODO
         return GenearteSentimentAnalysisData(
             task_name=self.task_name, absa_base_path=self.absa_base_path)
 
     def output(self):
-        return self.make_model_target(f'absa_bert_pair_{self.task_name}')
+        return self.make_model_target(f'absa_bert_pair_{self.task_name}.pkl')
 
     def run(self):
-        args = "hello"
-        if args.local_rank == -1 or args.no_cuda:
+        data = self.load()
+        if self.local_rank == -1 or self.no_cuda:
             device = torch.device("cuda" if torch.cuda.is_available()
-                                  and not args.no_cuda else "cpu")
+                                  and not self.no_cuda else "cpu")
             n_gpu = torch.cuda.device_count()
         else:
-            device = torch.device("cuda", args.local_rank)
+            device = torch.device("cuda", self.local_rank)
             n_gpu = 1
-            # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+            # Initializes the distributed backend which will take care of
+            # sychronizing nodes/GPUs
             torch.distributed.init_process_group(backend='nccl')
-        logger.info("device %s n_gpu %d distributed training %r", device,
-                    n_gpu, bool(args.local_rank != -1))
 
-        if args.accumulate_gradients < 1:
-            raise ValueError(
-                "Invalid accumulate_gradients parameter: {}, should be >= 1".
-                format(args.accumulate_gradients))
+        logger.info(f"device: {device}, n_gpu: {n_gpu}, distributed training: "
+                    f"{bool(self.local_rank) != -1}")
 
-        args.train_batch_size = int(args.train_batch_size /
-                                    args.accumulate_gradients)
+        if self.accumulate_gradients < 1:
+            raise ValueError(f"Invalid accumulate_gradients parameter: "
+                             f"{self.accumulate_gradients}, should be >= 1")
 
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
+        self.train_batch_size = int(self.train_batch_size /
+                                    self.accumulate_gradients)
+
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
         if n_gpu > 0:
-            torch.cuda.manual_seed_all(args.seed)
+            torch.cuda.manual_seed_all(self.seed)
 
-        bert_config = BertConfig.from_json_file(args.bert_config_file)
+        bert_config = BertConfig.from_json_file(self.bert_config_file)
 
-        if args.max_seq_length > bert_config.max_position_embeddings:
+        if self.max_seq_length > bert_config.max_position_embeddings:
             raise ValueError(
-                "Cannot use sequence length {} because the BERT model was only trained up to sequence length {}"
-                .format(args.max_seq_length,
-                        bert_config.max_position_embeddings))
-
-        if os.path.exists(args.output_dir) and os.listdir(args.output_dir):
-            raise ValueError(
-                "Output directory ({}) already exists and is not empty.".
-                format(args.output_dir))
-        os.makedirs(args.output_dir, exist_ok=True)
+                f"Cannot use sequence length {self.max_seq_length} because "
+                f"the BERT model was only trained up to sequence length "
+                f"{bert_config.max_position_embeddings}")
 
         # prepare dataloaders
-        processors = {
-            "sentihood_single": Sentihood_single_Processor,
-            "sentihood_NLI_M": Sentihood_NLI_M_Processor,
-            "sentihood_QA_M": Sentihood_QA_M_Processor,
-            "sentihood_NLI_B": Sentihood_NLI_B_Processor,
-            "sentihood_QA_B": Sentihood_QA_B_Processor,
-            "semeval_single": Semeval_single_Processor,
-            "semeval_NLI_M": Semeval_NLI_M_Processor,
-            "semeval_QA_M": Semeval_QA_M_Processor,
-            "semeval_NLI_B": Semeval_NLI_B_Processor,
-            "semeval_QA_B": Semeval_QA_B_Processor,
+        label_lists = {
+            "NLI_M": ['neutral', 'positive', 'negative'],
+            "QA_M": ['neutral', 'positive', 'negative'],
+            "NLI_B": ['0', '1'],
+            "QA_B": ['0', '1']
         }
 
-        processor = processors[args.task_name]()
-        label_list = processor.get_labels()
+        label_list = label_lists[self.task_name]
 
         tokenizer = tokenization.FullTokenizer(
-            vocab_file=args.vocab_file, do_lower_case=args.do_lower_case)
+            vocab_file=self.vocab_file, do_lower_case=self.do_lower_case)
 
         # training set
-        train_examples = None
-        num_train_steps = None
-        train_examples = processor.get_train_examples(args.data_dir)
+        train_examples = create_examples(data, 'train')
+
         num_train_steps = int(
-            len(train_examples) / args.train_batch_size *
-            args.num_train_epochs)
+            len(train_examples) / self.train_batch_size *
+            self.num_train_epochs)
 
         train_features = convert_examples_to_features(train_examples,
                                                       label_list,
-                                                      args.max_seq_length,
+                                                      self.max_seq_length,
                                                       tokenizer)
         logger.info("***** Running training *****")
-        logger.info("  Num examples = %d", len(train_examples))
-        logger.info("  Batch size = %d", args.train_batch_size)
-        logger.info("  Num steps = %d", num_train_steps)
+        logger.info(f"  Num examples = {len(train_examples)}")
+        logger.info(f"  Batch size = {self.train_batch_size}")
+        logger.info(f"  Num steps = {num_train_steps}")
 
         all_input_ids = torch.tensor([f.input_ids for f in train_features],
                                      dtype=torch.long)
@@ -272,47 +284,47 @@ class BertFineTuningTrainer(gokart.TaskOnKart):
 
         train_data = TensorDataset(all_input_ids, all_input_mask,
                                    all_segment_ids, all_label_ids)
-        if args.local_rank == -1:
+        if self.local_rank == -1:
             train_sampler = RandomSampler(train_data)
         else:
             train_sampler = DistributedSampler(train_data)
         train_dataloader = DataLoader(train_data,
                                       sampler=train_sampler,
-                                      batch_size=args.train_batch_size)
+                                      batch_size=self.train_batch_size)
 
         # test set
-        if args.eval_test:
-            test_examples = processor.get_test_examples(args.data_dir)
-            test_features = convert_examples_to_features(
-                test_examples, label_list, args.max_seq_length, tokenizer)
+        if self.eval_test:
+            dev_examples = create_examples(data, 'dev')
+            dev_features = convert_examples_to_features(
+                dev_examples, label_list, self.max_seq_length, tokenizer)
 
-            all_input_ids = torch.tensor([f.input_ids for f in test_features],
+            all_input_ids = torch.tensor([f.input_ids for f in dev_features],
                                          dtype=torch.long)
-            all_input_mask = torch.tensor(
-                [f.input_mask for f in test_features], dtype=torch.long)
+            all_input_mask = torch.tensor([f.input_mask for f in dev_features],
+                                          dtype=torch.long)
             all_segment_ids = torch.tensor(
-                [f.segment_ids for f in test_features], dtype=torch.long)
-            all_label_ids = torch.tensor([f.label_id for f in test_features],
+                [f.segment_ids for f in dev_features], dtype=torch.long)
+            all_label_ids = torch.tensor([f.label_id for f in dev_features],
                                          dtype=torch.long)
 
-            test_data = TensorDataset(all_input_ids, all_input_mask,
-                                      all_segment_ids, all_label_ids)
-            test_dataloader = DataLoader(test_data,
-                                         batch_size=args.eval_batch_size,
-                                         shuffle=False)
+            dev_data = TensorDataset(all_input_ids, all_input_mask,
+                                     all_segment_ids, all_label_ids)
+            dev_dataloader = DataLoader(dev_data,
+                                        batch_size=self.eval_batch_size,
+                                        shuffle=False)
 
         # model and optimizer
         model = BertForSequenceClassification(bert_config, len(label_list))
-        if args.init_checkpoint is not None:
+        if self.init_checkpoint is not None:
             model.bert.load_state_dict(
-                torch.load(args.init_checkpoint, map_location='cpu'))
+                torch.load(self.init_checkpoint, map_location='cpu'))
         model.to(device)
 
-        if args.local_rank != -1:
+        if self.local_rank != -1:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
-                device_ids=[args.local_rank],
-                output_device=args.local_rank)
+                device_ids=[self.local_rank],
+                output_device=self.local_rank)
         elif n_gpu > 1:
             model = torch.nn.DataParallel(model)
 
@@ -334,23 +346,14 @@ class BertFineTuningTrainer(gokart.TaskOnKart):
         }]
 
         optimizer = BERTAdam(optimizer_parameters,
-                             lr=args.learning_rate,
-                             warmup=args.warmup_proportion,
+                             lr=self.learning_rate,
+                             warmup=self.warmup_proportion,
                              t_total=num_train_steps)
 
         # train
-        output_log_file = os.path.join(args.output_dir, "log.txt")
-        print("output_log_file=", output_log_file)
-        with open(output_log_file, "w") as writer:
-            if args.eval_test:
-                writer.write(
-                    "epoch\tglobal_step\tloss\ttest_loss\ttest_accuracy\n")
-            else:
-                writer.write("epoch\tglobal_step\tloss\n")
-
         global_step = 0
         epoch = 0
-        for _ in trange(int(args.num_train_epochs), desc="Epoch"):
+        for _ in trange(int(self.num_train_epochs), desc="Epoch"):
             epoch += 1
             model.train()
             tr_loss = 0
@@ -362,64 +365,55 @@ class BertFineTuningTrainer(gokart.TaskOnKart):
                 loss, _ = model(input_ids, segment_ids, input_mask, label_ids)
                 if n_gpu > 1:
                     loss = loss.mean()  # mean() to average on multi-gpu.
-                if args.gradient_accumulation_steps > 1:
-                    loss = loss / args.gradient_accumulation_steps
+                if self.gradient_accumulation_steps > 1:
+                    loss = loss / self.gradient_accumulation_steps
                 loss.backward()
                 tr_loss += loss.item()
                 nb_tr_examples += input_ids.size(0)
                 nb_tr_steps += 1
-                if (step + 1) % args.gradient_accumulation_steps == 0:
+                if (step + 1) % self.gradient_accumulation_steps == 0:
                     optimizer.step()  # We have accumulated enought gradients
                     model.zero_grad()
                     global_step += 1
 
             # eval_test
-            if args.eval_test:
+            if self.eval_test:
                 model.eval()
-                test_loss, test_accuracy = 0, 0
-                nb_test_steps, nb_test_examples = 0, 0
-                with open(
-                        os.path.join(args.output_dir,
-                                     "test_ep_" + str(epoch) + ".txt"),
-                        "w") as f_test:
-                    for input_ids, input_mask, segment_ids, label_ids in test_dataloader:
-                        input_ids = input_ids.to(device)
-                        input_mask = input_mask.to(device)
-                        segment_ids = segment_ids.to(device)
-                        label_ids = label_ids.to(device)
+                dev_loss, dev_accuracy = 0, 0
+                nb_dev_steps, nb_dev_examples = 0, 0
+                for input_ids, input_mask, segment_ids, label_ids in dev_dataloader:
+                    input_ids = input_ids.to(device)
+                    input_mask = input_mask.to(device)
+                    segment_ids = segment_ids.to(device)
+                    label_ids = label_ids.to(device)
 
-                        with torch.no_grad():
-                            tmp_test_loss, logits = model(
-                                input_ids, segment_ids, input_mask, label_ids)
+                    with torch.no_grad():
+                        tmp_dev_loss, logits = model(input_ids, segment_ids,
+                                                     input_mask, label_ids)
 
-                        logits = F.softmax(logits, dim=-1)
-                        logits = logits.detach().cpu().numpy()
-                        label_ids = label_ids.to('cpu').numpy()
-                        outputs = np.argmax(logits, axis=1)
-                        for output_i in range(len(outputs)):
-                            f_test.write(str(outputs[output_i]))
-                            for ou in logits[output_i]:
-                                f_test.write(" " + str(ou))
-                            f_test.write("\n")
-                        tmp_test_accuracy = np.sum(outputs == label_ids)
+                    logits = F.softmax(logits, dim=-1)
+                    logits = logits.detach().cpu().numpy()
+                    label_ids = label_ids.to('cpu').numpy()
+                    outputs = np.argmax(logits, axis=1)
+                    tmp_dev_accuracy = np.sum(outputs == label_ids)
 
-                        test_loss += tmp_test_loss.mean().item()
-                        test_accuracy += tmp_test_accuracy
+                    dev_loss += tmp_dev_loss.mean().item()
+                    dev_accuracy += tmp_dev_accuracy
 
-                        nb_test_examples += input_ids.size(0)
-                        nb_test_steps += 1
+                    nb_dev_examples += input_ids.size(0)
+                    nb_dev_steps += 1
 
-                test_loss = test_loss / nb_test_steps
-                test_accuracy = test_accuracy / nb_test_examples
+                dev_loss = dev_loss / nb_dev_steps
+                dev_accuracy = dev_accuracy / nb_dev_examples
 
             result = collections.OrderedDict()
-            if args.eval_test:
+            if self.eval_test:
                 result = {
                     'epoch': epoch,
                     'global_step': global_step,
                     'loss': tr_loss / nb_tr_steps,
-                    'test_loss': test_loss,
-                    'test_accuracy': test_accuracy
+                    'dev_loss': dev_loss,
+                    'dev_accuracy': dev_accuracy
                 }
             else:
                 result = {
@@ -429,8 +423,5 @@ class BertFineTuningTrainer(gokart.TaskOnKart):
                 }
 
             logger.info("***** Eval results *****")
-            with open(output_log_file, "a+") as writer:
-                for key in result.keys():
-                    logger.info("  %s = %s\n", key, str(result[key]))
-                    writer.write("%s\t" % (str(result[key])))
-                writer.write("\n")
+            logger.info(', '.join(
+                ['{key}: value' for key, value in result.items()]))
